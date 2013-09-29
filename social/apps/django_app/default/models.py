@@ -37,6 +37,11 @@ class UserSocialAuth(models.Model, DjangoUserMixin):
         unique_together = ('provider', 'uid')
         db_table = 'social_auth_usersocialauth'
 
+    def save(self, *args, **kwargs):
+        if not self.extra_data:
+            self.extra_data = '{}'
+        super(UserSocialAuth, self).save(*args, **kwargs)
+
     @classmethod
     def get_social_auth(cls, provider, uid):
         try:
