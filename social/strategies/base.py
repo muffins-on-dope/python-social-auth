@@ -2,6 +2,8 @@ import time
 import random
 import hashlib
 
+import six
+
 from social.utils import setting_name, to_setting_name, module_member
 from social.store import OpenIdStore
 
@@ -31,21 +33,17 @@ class BaseStrategy(object):
                     'ABCDEFGHIJKLMNOPQRSTUVWXYZ' \
                     '0123456789'
 
-    def __init__(self, backend=None, storage=None, request=None, tpl=None,
-                 backends=None, *args, **kwargs):
-        tpl = tpl or BaseTemplateStrategy
-        if not isinstance(tpl, BaseTemplateStrategy):
-            tpl = tpl(self)
-        self.tpl = tpl
+    def __init__(self, backend=None, storage=None, request=None,
+                 tpl=BaseTemplateStrategy, backends=None, *args, **kwargs):
+        self.tpl = tpl(self)
         self.request = request
         self.storage = storage
         self.backends = backends
+        self.backend_name = None
+        self.backend = None
         if backend:
             self.backend_name = backend.name
             self.backend = backend(strategy=self, *args, **kwargs)
-        else:
-            self.backend_name = None
-            self.backend = backend
 
     def setting(self, name, default=None):
         names = (setting_name(self.backend_name, name),
@@ -104,22 +102,49 @@ class BaseStrategy(object):
     def from_session_value(self, val):
         return val
 
-    def to_session(self, next, backend, request=None, *args, **kwargs):
+    def partial_to_session(self, next, backend, request=None, *args, **kwargs):
+        user = kwargs.get('user')
+        social = kwargs.get('social')
+        clean_kwargs = {
+            'response': kwargs.get('response') or {},
+            'details': kwargs.get('details') or {},
+            'username': kwargs.get('username'),
+            'uid': kwargs.get('uid'),
+            'is_new': kwargs.get('is_new') or False,
+            'new_association': kwargs.get('new_association') or False,
+            'user': user and user.id or None,
+            'social': social and {
+                'provider': social.provider,
+                'uid': social.uid
+            } or None
+        }
+        # Only allow well-known serializable types
+        types = (dict, list, tuple, set) + six.integer_types + \
+                six.string_types + (six.text_type,) + (six.binary_type,)
+        clean_kwargs.update((name, value) for name, value in kwargs.items()
+                                if isinstance(value, types))
         return {
             'next': next,
             'backend': backend.name,
             'args': tuple(map(self.to_session_value, args)),
             'kwargs': dict((key, self.to_session_value(val))
-                           for key, val in kwargs.items())
+                                for key, val in clean_kwargs.items())
         }
 
-    def from_session(self, session):
+    def partial_from_session(self, session):
+        kwargs = session['kwargs'].copy()
+        user = kwargs.get('user')
+        social = kwargs.get('social')
+        if isinstance(social, dict):
+            kwargs['social'] = self.storage.user.get_social_auth(**social)
+        if user:
+            kwargs['user'] = self.storage.user.get_user(user)
         return (
             session['next'],
             session['backend'],
             list(map(self.from_session_value, session['args'])),
             dict((key, self.from_session_value(val))
-                    for key, val in session['kwargs'].items())
+                    for key, val in kwargs.items())
         )
 
     def clean_partial_pipeline(self, name='partial_pipeline'):
@@ -129,25 +154,31 @@ class BaseStrategy(object):
         return OpenIdStore(self)
 
     def get_pipeline(self):
-        return self.setting('PIPELINE', (
-            'social.pipeline.social_auth.social_details',
-            'social.pipeline.social_auth.social_uid',
-            'social.pipeline.social_auth.auth_allowed',
-            'social.pipeline.social_auth.social_user',
-            'social.pipeline.user.get_username',
-            # 'social.pipeline.mail.mail_validation',
-            # 'social.pipeline.social_auth.associate_by_email',
-            'social.pipeline.user.create_user',
-            'social.pipeline.social_auth.associate_user',
-            'social.pipeline.social_auth.load_extra_data',
-            'social.pipeline.user.user_details'))
+        return self.setting(
+            'PIPELINE', (
+                'social.pipeline.social_auth.social_details',
+                'social.pipeline.social_auth.social_uid',
+                'social.pipeline.social_auth.auth_allowed',
+                'social.pipeline.social_auth.social_user',
+                'social.pipeline.user.get_username',
+                # 'social.pipeline.mail.mail_validation',
+                # 'social.pipeline.social_auth.associate_by_email',
+                'social.pipeline.user.create_user',
+                'social.pipeline.social_auth.associate_user',
+                'social.pipeline.social_auth.load_extra_data',
+                'social.pipeline.user.user_details'
+            )
+        )
 
     def get_disconnect_pipeline(self):
-        return self.setting('DISCONNECT_PIPELINE', (
-            'social.pipeline.disconnect.allowed_to_disconnect',
-            'social.pipeline.disconnect.get_entries',
-            'social.pipeline.disconnect.revoke_tokens',
-            'social.pipeline.disconnect.disconnect'))
+        return self.setting(
+            'DISCONNECT_PIPELINE', (
+                'social.pipeline.disconnect.allowed_to_disconnect',
+                'social.pipeline.disconnect.get_entries',
+                'social.pipeline.disconnect.revoke_tokens',
+                'social.pipeline.disconnect.disconnect'
+            )
+        )
 
     def random_string(self, length=12, chars=ALLOWED_CHARS):
         # Implementation borrowed from django 1.4
@@ -158,9 +189,6 @@ class BaseStrategy(object):
             seed = '{0}{1}{2}'.format(random.getstate(), time.time(), key)
             random.seed(hashlib.sha256(seed.encode()).digest())
         return ''.join([random.choice(chars) for i in range(length)])
-
-    def is_integrity_error(self, exception):
-        return self.storage.is_integrity_error(exception)
 
     def absolute_uri(self, path=None):
         uri = self.build_absolute_uri(path)
@@ -187,6 +215,10 @@ class BaseStrategy(object):
             verification_code.verify()
             return True
 
+    def render_html(self, tpl=None, html=None, context=None):
+        """Render given template or raw html with given context"""
+        return self.tpl.render(tpl, html, context)
+
     # Implement the following methods on strategies sub-classes
 
     def redirect(self, url):
@@ -200,10 +232,6 @@ class BaseStrategy(object):
     def html(self, content):
         """Return HTTP response with given content"""
         raise NotImplementedError('Implement in subclass')
-
-    def render_html(self, tpl=None, html=None, context=None):
-        """Render given template or raw html with given context"""
-        return self.tpl.render(tpl, html, context)
 
     def request_data(self, merge=True):
         """Return current request data (POST or GET)"""
